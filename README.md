@@ -154,7 +154,3 @@ Siamux emits JSON application events with run ID, attempt, state, duration and t
 This MVP has no authentication, multitenancy, real AI providers, cancellation, rate limits, metrics dashboard, or cloud deployment. Compose binds exposed services to localhost and uses local-development database credentials. Pending work can grow without a queue limit. Dispatch scanning is intentionally simple and can produce duplicate messages; scaling it is a future measurement-driven improvement.
 
 See [verified checks](docs/verification.md) for the recorded implementation checks.
-
-Read [the learning walkthrough](docs/learning.md) to trace a request and prepare to explain the tradeoffs.
-
-References: [Celery delivery settings](https://docs.celeryq.dev/en/stable/userguide/configuration.html), [OpenTelemetry context propagation](https://opentelemetry.io/docs/languages/python/propagation/).
