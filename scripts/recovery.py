@@ -8,6 +8,11 @@ from uuid import uuid4
 
 import httpx
 
+if __package__:
+    from scripts.benchmark_common import credential_headers
+else:
+    from benchmark_common import credential_headers
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -22,7 +27,7 @@ def main():
             cwd=Path(__file__).resolve().parents[1],
         )
 
-    with httpx.Client(base_url=args.url, timeout=10) as client:
+    with httpx.Client(base_url=args.url, timeout=10, headers=credential_headers()) as client:
 
         def submit(delay):
             response = client.post(
@@ -34,7 +39,7 @@ def main():
                     "mock": {"delay_seconds": delay},
                 },
             )
-            assert response.status_code == 202, response.text
+            assert response.status_code == 202, response.status_code
             return response.json()["status_url"]
 
         def wait_for(url, status, timeout=90):
@@ -45,7 +50,7 @@ def main():
                 result = response.json()
                 if result["status"] == status:
                     return result
-                if result["status"] in {"SUCCEEDED", "FAILED"}:
+                if result["status"] in {"SUCCEEDED", "FAILED", "CANCELED"}:
                     raise AssertionError(result)
                 time.sleep(0.1)
             raise AssertionError(f"Timed out waiting for {url} to reach {status}")

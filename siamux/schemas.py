@@ -26,7 +26,7 @@ class CreateRun(BaseModel):
 
 class RunView(BaseModel):
     id: str
-    status: Literal["PENDING", "RUNNING", "SUCCEEDED", "FAILED"]
+    status: Literal["PENDING", "RUNNING", "SUCCEEDED", "FAILED", "CANCELED"]
     provider: str
     model: str
     created_at: datetime

@@ -1,4 +1,4 @@
-"""Synthetic workload; reports measured values only, never estimates."""
+"""Bounded client-observation workload; durable reconciliation is supplied by isolated runner."""
 
 import argparse
 import asyncio
@@ -9,68 +9,96 @@ from uuid import uuid4
 
 import httpx
 
+if __package__:
+    from scripts.benchmark_common import (
+        SCHEMA_VERSION,
+        Intent,
+        accounting,
+        credential_headers,
+        poll_intent,
+        provenance,
+        submit_intent,
+        timing_diagnostics,
+    )
+else:
+    from benchmark_common import (
+        SCHEMA_VERSION,
+        Intent,
+        accounting,
+        credential_headers,
+        poll_intent,
+        provenance,
+        submit_intent,
+        timing_diagnostics,
+    )
+
 
 def percentile(values, fraction):
+    values = [v for v in values if v is not None]
     return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)] if values else None
 
 
-async def benchmark(args):
-    semaphore = asyncio.Semaphore(args.concurrency)
-    accepted, completed, queue_ms, attempts, failures = [], [], [], [], []
-    start = time.monotonic()
-    async with httpx.AsyncClient(base_url=args.url, timeout=10) as client:
-
-        async def run(index):
-            async with semaphore:
-                began = time.monotonic()
-                try:
-                    response = await client.post(
-                        "/v1/runs",
-                        headers={"Idempotency-Key": str(uuid4())},
-                        json={
-                            "provider": "mock",
-                            "input": f"benchmark {index}",
-                            "mock": {
-                                "delay_seconds": args.delay,
-                                "fail_first_attempts": args.fail_first,
-                            },
-                        },
-                    )
-                    response.raise_for_status()
-                    accepted.append((time.monotonic() - began) * 1000)
-                    status_url = response.json()["status_url"]
-                    while time.monotonic() - began < args.timeout:
-                        result = await client.get(status_url)
-                        result.raise_for_status()
-                        job = result.json()
-                        if job["status"] in {"SUCCEEDED", "FAILED"}:
-                            if job["status"] == "FAILED":
-                                failures.append(job["error"]["code"])
-                            else:
-                                completed.append((time.monotonic() - began) * 1000)
-                            queue_ms.append(job["queue_latency_ms"])
-                            attempts.append(job["attempts"])
-                            return
-                        await asyncio.sleep(0.1)
-                    failures.append("POLL_TIMEOUT")
-                except httpx.HTTPError as exc:
-                    failures.append(type(exc).__name__)
-
-        await asyncio.gather(*(run(i) for i in range(args.jobs)))
-    elapsed = time.monotonic() - start
+def summarize(intents, elapsed):
+    counts = accounting(intents)
+    timings = [timing_diagnostics(i) for i in intents]
+    passed = (
+        bool(intents)
+        and counts["succeeded"] == len(intents)
+        and not counts["client_unresolved_committed"]
+        and not any(t["anomalies"] for t in timings)
+    )
     return {
-        "workload": vars(args),
+        **counts,
         "elapsed_seconds": elapsed,
-        "accepted": len(accepted),
-        "succeeded": len(completed),
-        "failed": len(failures),
-        "errors": failures,
-        "successful_jobs_per_second": len(completed) / elapsed,
-        "acceptance_p50_ms": percentile(accepted, 0.5),
-        "acceptance_p95_ms": percentile(accepted, 0.95),
-        "completion_p95_ms": percentile(completed, 0.95),
-        "queue_p95_ms": percentile(queue_ms, 0.95),
-        "total_attempts": sum(attempts),
+        "passed": passed,
+        "successful_jobs_per_second": counts["succeeded"] / elapsed if elapsed else None,
+        "acceptance_p50_ms": percentile([i.acceptance_ms for i in intents], 0.5),
+        "acceptance_p95_ms": percentile([i.acceptance_ms for i in intents], 0.95),
+        "completion_p95_ms": percentile([i.completion_ms for i in intents], 0.95),
+        "queue_p95_ms": percentile(
+            [(i.database or i.observed).get("queue_latency_ms") for i in intents], 0.95
+        ),
+        "total_attempts": sum((i.database or i.observed).get("attempts", 0) for i in intents),
+        "timing_diagnostics": timings,
+        "intents": [i.report() for i in intents],
+    }
+
+
+async def benchmark(args, *, client=None, intents=None, experiment_id=None):
+    if client is None:
+        async with httpx.AsyncClient(
+            base_url=args.url, headers=credential_headers(), timeout=10
+        ) as owned:
+            return await benchmark(args, client=owned, intents=intents, experiment_id=experiment_id)
+    experiment_id = experiment_id or str(uuid4())
+    records = []
+    semaphore = asyncio.Semaphore(args.concurrency)
+    start = time.monotonic()
+
+    async def run(index):
+        async with semaphore:
+            intent = Intent(
+                experiment_id,
+                {
+                    "provider": "mock",
+                    "input": f"benchmark {index}",
+                    "mock": {"delay_seconds": args.delay, "fail_first_attempts": args.fail_first},
+                },
+            )
+            records.append(intent)
+            if intents is not None:
+                intents.append(intent)
+            began = time.monotonic()
+            if await submit_intent(client, intent, min(10, args.timeout)):
+                await poll_intent(client, intent, max(0, args.timeout - (time.monotonic() - began)))
+
+    await asyncio.gather(*(run(i) for i in range(args.jobs)))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "experiment_id": experiment_id,
+        "source": provenance(),
+        "workload": {k: v for k, v in vars(args).items() if k != "url"},
+        **summarize(records, time.monotonic() - start),
     }
 
 

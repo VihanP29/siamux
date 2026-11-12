@@ -177,3 +177,30 @@ def test_dispatch_waits_for_active_lease(submit):
     change(run_id, lease_until=utcnow() - timedelta(seconds=1))
     assert dispatch_once(publish=published.append) == 1
     assert published == [run_id]
+
+
+def test_cancel_running_run_fences_late_completion(submit, client, monkeypatch):
+    run = submit().json()
+    started, finish = Event(), Event()
+
+    async def blocked(*args):
+        started.set()
+        await asyncio.to_thread(finish.wait, 5)
+        return {"text": "too late"}
+
+    monkeypatch.setattr(worker, "invoke", blocked)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        execution = pool.submit(worker.process_run, run["id"])
+        try:
+            assert started.wait(5)
+            canceled = client.post(f"{run['status_url']}/cancel")
+            assert canceled.status_code == 200
+            assert canceled.json()["status"] == "CANCELED"
+        finally:
+            finish.set()
+        assert not execution.result(timeout=5)
+    saved = read(run["id"])
+    assert saved.status == "CANCELED"
+    assert saved.output is None
+    assert saved.error["code"] == "RUN_CANCELED"
+    assert dispatch_once(publish=worker.process_run) == 0

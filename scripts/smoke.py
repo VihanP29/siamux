@@ -6,12 +6,17 @@ from uuid import uuid4
 
 import httpx
 
+if __package__:
+    from scripts.benchmark_common import credential_headers
+else:
+    from benchmark_common import credential_headers
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://localhost:8000")
     args = parser.parse_args()
-    with httpx.Client(base_url=args.url, timeout=10) as client:
+    with httpx.Client(base_url=args.url, timeout=10, headers=credential_headers()) as client:
         client.get("/health/ready").raise_for_status()
         for scenario, options, expected, attempts in [
             ("success", {}, "SUCCEEDED", 1),
@@ -23,7 +28,7 @@ def main():
             headers = {"Idempotency-Key": key}
             body = {"provider": "mock", "input": "smoke test", "mock": options}
             response = client.post("/v1/runs", json=body, headers=headers)
-            assert response.status_code == 202, response.text
+            assert response.status_code == 202, response.status_code
             run = response.json()
             replay = client.post("/v1/runs", json=body, headers=headers)
             assert replay.status_code == 202 and replay.json()["id"] == run["id"]
@@ -34,7 +39,7 @@ def main():
                 status = client.get(run["status_url"])
                 status.raise_for_status()
                 result = status.json()
-                if result["status"] in {"SUCCEEDED", "FAILED"}:
+                if result["status"] in {"SUCCEEDED", "FAILED", "CANCELED"}:
                     break
                 time.sleep(0.2)
             else:

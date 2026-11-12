@@ -5,14 +5,16 @@ from time import monotonic
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from opentelemetry import propagate, trace
-from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy import select, text, update
+from sqlalchemy.exc import SQLAlchemyError
 
-from siamux.db import Run, session_factory
+from siamux.admission import admit
+from siamux.auth import authenticate
+from siamux.db import Run, session_factory, utcnow
 from siamux.schemas import CreateRun, RunView, view
 from siamux.telemetry import configure, event
 
@@ -26,13 +28,15 @@ async def lifespan(app):
 app = FastAPI(title="Siamux", version="0.1.0", lifespan=lifespan)
 
 
-def problem(status, code, message):
-    return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
+def problem(status, code, message, headers=None):
+    return JSONResponse(
+        status_code=status, content={"error": {"code": code, "message": message}}, headers=headers
+    )
 
 
 @app.exception_handler(HTTPException)
 async def http_error(request, exc):
-    return problem(exc.status_code, exc.detail["code"], exc.detail["message"])
+    return problem(exc.status_code, exc.detail["code"], exc.detail["message"], exc.headers)
 
 
 @app.exception_handler(RequestValidationError)
@@ -66,6 +70,8 @@ async def trace_request(request: Request, call_next):
         f"HTTP {request.method}",
         context=propagate.extract(dict(request.headers)),
         kind=trace.SpanKind.SERVER,
+        record_exception=False,
+        set_status_on_exception=False,
     ) as span:
         response = await call_next(request)
         span.set_attribute("http.response.status_code", response.status_code)
@@ -93,6 +99,7 @@ def ready():
 @app.post("/v1/runs", response_model=RunView, status_code=202)
 def create_run(
     body: CreateRun,
+    tenant_id: Annotated[str, Depends(authenticate)],
     response: Response,
     idempotency_key: Annotated[str, Header(min_length=1, max_length=100)],
 ):
@@ -112,40 +119,53 @@ def create_run(
     ).hexdigest()
     carrier = {}
     propagate.inject(carrier)
-    with session_factory()() as session:
-        run = Run(
-            idempotency_key=idempotency_key,
-            request_hash=digest,
-            request=payload,
-            trace_context=carrier,
-        )
-        session.add(run)
-        try:
-            # The durable row doubles as dispatch intent: no database/broker dual write.
-            session.commit()
-        except IntegrityError:
-            session.rollback()
-            run = session.scalar(select(Run).where(Run.idempotency_key == idempotency_key))
-            if run is None:
-                raise
-            if run.request_hash != digest:
-                raise HTTPException(
-                    409,
-                    detail={
-                        "code": "IDEMPOTENCY_CONFLICT",
-                        "message": "Key already used for another request.",
-                    },
-                ) from None
-        result = view(run)
-        response.headers["Location"] = result.status_url
-        event("run_accepted", run_id=run.id, status=run.status)
-        return result
+    run = admit(tenant_id, idempotency_key, digest, payload, carrier)
+    result = view(run)
+    response.headers["Location"] = result.status_url
+    event("run_accepted", run_id=run.id, status=run.status)
+    return result
 
 
 @app.get("/v1/runs/{run_id}", response_model=RunView)
-def get_run(run_id: UUID):
+def get_run(run_id: UUID, tenant_id: Annotated[str, Depends(authenticate)]):
     with session_factory()() as session:
-        run = session.get(Run, str(run_id))
+        run = session.scalar(select(Run).where(Run.id == str(run_id), Run.tenant_id == tenant_id))
         if run is None:
             raise HTTPException(404, detail={"code": "RUN_NOT_FOUND", "message": "Run not found."})
+        return view(run)
+
+
+@app.post("/v1/runs/{run_id}/cancel", response_model=RunView)
+def cancel_run(run_id: UUID, tenant_id: Annotated[str, Depends(authenticate)]):
+    """Atomically cancel accepted work without allowing a late result to overwrite it."""
+    now = utcnow()
+    run_id = str(run_id)
+    with session_factory()() as session:
+        canceled = session.execute(
+            update(Run)
+            .where(
+                Run.id == run_id, Run.tenant_id == tenant_id, Run.status.in_(("PENDING", "RUNNING"))
+            )
+            .values(
+                status="CANCELED",
+                completed_at=now,
+                claim_token=None,
+                lease_until=None,
+                output=None,
+                error={"code": "RUN_CANCELED", "message": "Run canceled by client."},
+            )
+        )
+        session.commit()
+        run = session.scalar(select(Run).where(Run.id == run_id, Run.tenant_id == tenant_id))
+        if run is None:
+            raise HTTPException(404, detail={"code": "RUN_NOT_FOUND", "message": "Run not found."})
+        if canceled.rowcount == 0 and run.status != "CANCELED":
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "RUN_NOT_CANCELABLE",
+                    "message": f"Run already reached terminal status {run.status}.",
+                },
+            )
+        event("run_canceled", run_id=run.id, status=run.status)
         return view(run)

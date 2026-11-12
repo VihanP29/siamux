@@ -84,6 +84,34 @@ def test_unsupported(submit, overrides):
 def test_missing_and_malformed_id(client):
     assert client.get(f"/v1/runs/{uuid4()}").status_code == 404
     assert client.get("/v1/runs/not-a-uuid").status_code == 422
+    assert client.post(f"/v1/runs/{uuid4()}/cancel").status_code == 404
+    assert client.post("/v1/runs/not-a-uuid/cancel").status_code == 422
+
+
+def test_cancel_pending_run_is_idempotent(submit, client):
+    run = submit().json()
+    first = client.post(f"{run['status_url']}/cancel")
+    assert first.status_code == 200
+    canceled = first.json()
+    assert canceled["status"] == "CANCELED"
+    assert canceled["error"]["code"] == "RUN_CANCELED"
+    assert canceled["completed_at"] is not None
+    assert canceled["attempts"] == 0
+    assert client.post(f"{run['status_url']}/cancel").json() == canceled
+    assert not process_run(run["id"])
+
+
+@pytest.mark.parametrize("terminal_status", ["SUCCEEDED", "FAILED"])
+def test_cannot_cancel_completed_run(submit, client, terminal_status):
+    options = {"delay_seconds": 0.0}
+    if terminal_status == "FAILED":
+        options["permanent_failure"] = True
+    run = submit(mock=options).json()
+    assert process_run(run["id"])
+    response = client.post(f"{run['status_url']}/cancel")
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "RUN_NOT_CANCELABLE"
+    assert client.get(run["status_url"]).json()["status"] == terminal_status
 
 
 def test_concurrent_idempotency(submit):

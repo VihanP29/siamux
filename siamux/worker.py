@@ -91,7 +91,11 @@ def process_run(run_id: str) -> bool:
 
     tracer = trace.get_tracer("siamux")
     with tracer.start_as_current_span(
-        "run.execute", context=propagate.extract(carrier), kind=trace.SpanKind.CONSUMER
+        "run.execute",
+        context=propagate.extract(carrier),
+        kind=trace.SpanKind.CONSUMER,
+        record_exception=False,
+        set_status_on_exception=False,
     ) as span:
         span.set_attribute("run.id", run_id)
         span.set_attribute("run.attempt", attempt)
@@ -100,7 +104,9 @@ def process_run(run_id: str) -> bool:
         output, error = None, None
         retryable = False
         try:
-            with tracer.start_as_current_span("provider.generate"):
+            with tracer.start_as_current_span(
+                "provider.generate", record_exception=False, set_status_on_exception=False
+            ):
                 output = asyncio.run(invoke(request, attempt, config.provider_timeout))
         except ProviderFailure as exc:
             error = {"code": exc.code, "message": str(exc)}

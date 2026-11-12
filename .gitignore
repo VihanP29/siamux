@@ -9,3 +9,5 @@ __pycache__/
 .coverage
 benchmark-results*.json
 docs/learning.md
+
+benchmark-results/

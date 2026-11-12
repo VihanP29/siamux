@@ -2,7 +2,7 @@
 
 Siamux is an asynchronous job-processing service built with FastAPI, PostgreSQL, Redis, and Celery. Clients submit generation requests, receive a run ID, and poll for results. PostgreSQL stores job state and retry schedules; Redis transports work to the workers.
 
-The current implementation uses a configurable mock provider for testing timeouts, retries, and recovery. It does not require an external API key.
+The current implementation uses a configurable mock provider for testing timeouts, retries, and recovery. It requires no provider credentials; clients authenticate with locally issued Siamux API keys.
 
 ## Quick start
 
@@ -19,10 +19,22 @@ This starts the API, PostgreSQL, Redis, dispatcher, Celery worker, and Jaeger. D
 - [API documentation](http://localhost:8000/docs)
 - [Traces](http://localhost:16686)
 
+New to the codebase? Follow the [guided codebase tour](docs/guide.md) before changing it.
+
+Issue a client key for the migrated development tenant (the key is shown only once).
+There is no default client key:
+
+```sh
+export SIAMUX_API_KEY="$(docker compose exec -T api python -m siamux.admin key create \
+  --tenant 00000000-0000-0000-0000-000000000001 \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])')"
+```
+
 Submit a run:
 
 ```sh
 curl -i http://localhost:8000/v1/runs \
+  -H "Authorization: Bearer $SIAMUX_API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: example-001' \
   -d '{"provider":"mock","input":"Summarize this request"}'
@@ -31,7 +43,8 @@ curl -i http://localhost:8000/v1/runs \
 The API returns `202 Accepted` with a run ID and `status_url`. Use that URL to retrieve the state and result:
 
 ```sh
-curl 'http://localhost:8000/v1/runs/<run_id>'
+curl -H "Authorization: Bearer $SIAMUX_API_KEY" \
+  'http://localhost:8000/v1/runs/<run_id>'
 ```
 
 To inspect logs or stop the services:
@@ -68,14 +81,15 @@ Execution is **at least once**. A crash after a provider call but before the res
 | --- | --- |
 | `POST /v1/runs` | Accept a request or return an existing run for the same idempotency key |
 | `GET /v1/runs/{run_id}` | Retrieve state, result, error, timestamps, and attempt count |
+| `POST /v1/runs/{run_id}/cancel` | Idempotently cancel pending or running work |
 | `GET /health/live` | Check API availability |
 | `GET /health/ready` | Check database connectivity and schema availability |
 
-Requests require an `Idempotency-Key` header containing 1–100 characters and a nonblank value. Repeating a key with the same normalized request returns the original run; a different request returns `409 Conflict`. Keys are global and retained with the run.
+All `/v1/runs` operations require `Authorization: Bearer <key>`. Health probes remain anonymous. Foreign and missing run IDs both return `404 RUN_NOT_FOUND`. Submissions also require an `Idempotency-Key` header containing 1–100 characters and a nonblank value. Repeating a key with the same normalized request returns the original run; a different request returns `409 Conflict`. Keys are scoped to the authenticated tenant and retained with the run. Tenant identity cannot be supplied in the request body.
 
 The request body requires `provider: "mock"` and `input` containing 1–10,000 characters after trimming surrounding whitespace. `model` defaults to `mock-basic`. Unknown fields are rejected. See the generated API documentation for the full schema.
 
-Runs move from `PENDING` to `RUNNING`, then to `SUCCEEDED` or `FAILED`. Retryable failures return to `PENDING` until the next attempt is due. A failed run is returned by GET with HTTP `200` and a structured `error`; invalid submissions are rejected before a run is created.
+Runs move from `PENDING` to `RUNNING`, then to `SUCCEEDED`, `FAILED`, or `CANCELED`. Retryable failures return to `PENDING` until the next attempt is due. Canceling a pending run prevents execution. Canceling a running run prevents its result from being committed, although an in-flight provider call may still finish. Cancellation is idempotent; attempting to cancel a succeeded or failed run returns `409 Conflict`. A failed or canceled run is returned by GET with HTTP `200` and a structured `error`; invalid submissions are rejected before a run is created.
 
 ## Configuration
 
@@ -120,7 +134,7 @@ ruff check .
 ruff format --check .
 ```
 
-Tests use temporary SQLite databases by default. Set `SIAMUX_TEST_DATABASE_URL` to run them against PostgreSQL. Use a disposable test database: the fixtures clear its `runs` table.
+Tests use temporary SQLite databases by default. Set `SIAMUX_TEST_DATABASE_URL` to run them against PostgreSQL. Use a disposable test database: the fixtures migrate it and clear runs, keys, tenants, and admission policy. Populated migration tests use separate SQLite files or temporary PostgreSQL schemas.
 
 With the Compose stack running:
 
@@ -144,4 +158,24 @@ Run responses include `queue_latency_ms` for the time between acceptance and the
 
 ## Current scope
 
-This is a local development setup. Services bind to localhost and use development credentials; Jaeger storage is ephemeral. Authentication, tenant isolation, real provider integrations, cancellation, and admission limits are not implemented.
+This is a local development setup. Services bind to localhost and use development credentials; Jaeger storage is ephemeral. Tenant authentication and durable backlog limits are implemented. Real provider integrations, provider-side aborts, attempt history, and aggregate monitoring remain follow-up work. PostgreSQL contention tests and isolated container benchmarks now pass; see [verification](docs/verification.md) for workloads, clock diagnostics, and measurement limits.
+
+## Resume benchmark experiments
+
+See [the benchmark guide](docs/benchmarks.md) for isolated Redis-outage, worker-crash,
+worker-scaling, and concurrent-idempotency experiments with saved JSON results.
+
+
+## Tenants, migrations, and backlog limits
+
+See [operator instructions](docs/operations.md) for tenant creation, key rotation,
+migration/backfill and downgrade restrictions, and changing database-stored limits.
+Defaults are 100 outstanding runs per tenant and 1,000 globally. Pending and running
+runs (including retries and expired leases) consume capacity. Replays and conflicts
+are resolved before checking capacity. Full tenants receive `429
+TENANT_CAPACITY_EXCEEDED`; a full service receives `503 SERVICE_CAPACITY_EXCEEDED`.
+Both include `Retry-After: 5`, a hint rather than a completion promise. Database
+failures return `503 DATABASE_UNAVAILABLE`; always retry with the same key.
+
+The [canonical roadmap](docs/roadmap.md) describes the product direction;
+[plan.md](plan.md) records the immediate PR 0–3 scope and remaining validation gates.

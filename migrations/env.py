@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 from alembic import context
 
 from siamux.db import Base, engine
@@ -11,7 +13,11 @@ if context.is_offline_mode():
     with context.begin_transaction():
         context.run_migrations()
 else:
-    with engine().connect() as connection:
+    with (
+        nullcontext(context.config.attributes["connection"])
+        if "connection" in context.config.attributes
+        else engine().connect()
+    ) as connection:
         context.configure(connection=connection, target_metadata=Base.metadata)
         with context.begin_transaction():
             context.run_migrations()

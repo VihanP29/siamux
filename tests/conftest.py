@@ -1,12 +1,15 @@
 import os
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
 
 from siamux.api import app
+from siamux.auth import issue_key
 from siamux.config import get_settings
-from siamux.db import Base, Run, engine, session_factory
+from siamux.db import AdmissionPolicy, APIKey, Base, Run, Tenant, engine, session_factory
 
 
 @pytest.fixture(autouse=True)
@@ -18,9 +21,16 @@ def database(tmp_path, monkeypatch):
     monkeypatch.setenv("SIAMUX_RETRY_BASE_SECONDS", "0.01")
     get_settings.cache_clear()
     engine.cache_clear()
-    Base.metadata.create_all(engine())
+    if engine().dialect.name == "postgresql":
+        command.upgrade(Config("alembic.ini"), "head")
+    else:
+        Base.metadata.create_all(engine())
     with session_factory()() as session:
         session.execute(delete(Run))
+        session.execute(delete(APIKey))
+        session.execute(delete(Tenant))
+        session.execute(delete(AdmissionPolicy))
+        session.add(AdmissionPolicy(id=1, max_outstanding=1000))
         session.commit()
     yield
     engine().dispose()
@@ -29,8 +39,25 @@ def database(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def client():
+def identity():
+    with session_factory()() as session:
+        tenant = Tenant(name="test")
+        session.add(tenant)
+        session.flush()
+        raw = issue_key(session, tenant.id)
+        session.commit()
+        return tenant.id, raw
+
+
+@pytest.fixture
+def anonymous():
     with TestClient(app) as client:
+        yield client
+
+
+@pytest.fixture
+def client(identity):
+    with TestClient(app, headers={"Authorization": f"Bearer {identity[1]}"}) as client:
         yield client
 
 
