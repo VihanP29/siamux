@@ -29,6 +29,7 @@ jobs:
       - run: ruff check . && ruff format --check .
       - run: alembic upgrade head && alembic check
       - run: pytest -q
+      - run: env -u SIAMUX_TEST_DATABASE_URL pytest -q
       - run: alembic downgrade base && alembic upgrade head
   stack:
     runs-on: ubuntu-latest
@@ -39,7 +40,19 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.lock
       - run: docker compose up --build -d --wait
-      - run: python scripts/smoke.py
-      - run: python scripts/recovery.py
+      - name: Authenticated lifecycle and recovery
+        run: |
+          python - <<'PYCODE'
+          import json
+          import os
+          import subprocess
+          import sys
+          prefix = ["docker", "compose", "exec", "-T", "api", "python", "-m", "siamux.admin"]
+          tenant = json.loads(subprocess.check_output(prefix + ["tenant", "create", "--name", "ci-client"]))
+          key = json.loads(subprocess.check_output(prefix + ["key", "create", "--tenant", tenant["tenant_id"]]))["key"]
+          environment = {**os.environ, "SIAMUX_API_KEY": key}
+          subprocess.run([sys.executable, "scripts/smoke.py"], env=environment, check=True)
+          subprocess.run([sys.executable, "scripts/recovery.py"], env=environment, check=True)
+          PYCODE
       - if: always()
         run: docker compose logs --no-color && docker compose down --volumes
